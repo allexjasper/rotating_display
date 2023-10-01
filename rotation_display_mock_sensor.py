@@ -19,11 +19,13 @@ data = []
 count = 0
 # Strips the newline character
 for line in Lines:
-    match =  re.match("(\d*);(\d*.\d*)", line.strip())
+    #match =  re.match("(\d*);(\d*.\d*)", line.strip())
+    match =  re.match("(\d*);(\d*)", line.strip())
+   
     if match == None:
         continue
     tuple = [0,0.0]
-    tuple[0] =  float(match.group(2))
+    tuple[0] =  int(match.group(2))
     tuple[1] = int(match.group(1))
     data.append(tuple)
 

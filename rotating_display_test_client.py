@@ -55,9 +55,9 @@ def calc_reference_rotation():
 
 
     allAngles.sort()
-    allAngles = remove_outliers(allAngles)
+    #allAngles = remove_outliers(allAngles)
     allAngles.reverse()
-    allAngles = remove_outliers(allAngles)
+    #allAngles = remove_outliers(allAngles)
     allAngles.reverse()
 
     #print the angles range
@@ -145,6 +145,13 @@ def calc_reference_rotation():
 def segment_data():
     samplesLock.acquire()
     samples = samplesDeq.copy()
+    if len(samplesDeq) > 900:
+        
+        #write samplesDeq to CSV file
+        with open('sample_data_out.csv', 'w') as f:
+            for sample in samples:
+                f.write(str(sample[1]) + ";" + str(int(sample[0]*100)) + "\n")
+        samplesDeq.clear()
     samplesLock.release()
 
     prevSample = None;
