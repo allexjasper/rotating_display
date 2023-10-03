@@ -3,29 +3,66 @@ import socket
 import time
 import re
 import matplotlib.pyplot as plt
-#plt.style.use('seaborn-whitegrid')
 import numpy as np
 import random
-from fastdtw import fastdtw
-from scipy.spatial.distance import euclidean
-from scipy import interpolate
-from tslearn.clustering import TimeSeriesKMeans
-from tslearn.datasets import CachedDatasets
-from tslearn.preprocessing import TimeSeriesScalerMeanVariance
-
-from tslearn.generators import random_walks
-from tslearn.preprocessing import TimeSeriesScalerMeanVariance
-from tslearn import metrics
-import tslearn
 import math
+import scipy.interpolate
+import threading
+import collections
+import copy
 
 sampleRate = 1
+
+magnetOffset = 321520
  
 # Using readlines()
 file1 = open('data\sample_data_out3V.csv', 'r')
 Lines = file1.readlines()
 
-def read_input(): 
+medianRotation = None
+
+inbound = collections.deque(maxlen=20000) #inbound queue of samlpes (angle, sensor time stamp, local timestamp), 
+lock_inbound = threading.Lock()
+rotations = collections.deque(maxlen=100)
+lock_rotations = threading.Lock()
+sensor_time_offset = 0 #time offset between sensor and local time
+transmission_delay = 10 
+reference_rotation = None #current reference roation
+lock_reference_rotation = threading.Lock()
+
+
+
+
+   
+                #current reference roation
+                #time offset sensor and local time
+
+def receive_sensor_data_udp():
+    serverAddressPort   = ("0.0.0.0", 20001)
+    bufferSize          = 256
+    UDPServerSocket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+    UDPServerSocket.bind(serverAddressPort)
+    while(True):
+        rawPacket = UDPServerSocket.recvfrom(bufferSize)
+        decodedPacket = rawPacket[0].decode('utf-8')
+        
+        match =  re.match("(\d*), (\d*)", decodedPacket)
+        if match == None:
+            continue
+        angle =  (int(match.group(1)) - magnetOffset)/ 1000.0
+        timestamp = int(match.group(2))
+        tuple = [0,0.0,0] #angle, sensor time stamp, local timestamp
+        tuple[0] = angle
+        tuple[1] = timestamp
+        tuple[2] = int(time.time() * 1000)
+        lock_inbound.acquire()
+        inbound.append(tuple)
+        lock_inbound.release()               
+
+
+def read_input_from_CSV(): 
+    global inbound
+    global lock_inbound
     data = []
     count = 0
     # Strips the newline character
@@ -52,8 +89,11 @@ def segment_data(data):
     curRotation = [0, [], 0]   # start timestamp, samples, duration
     for sample in samples:
         if prevSample is not None:
+            
+            #print(sample[0])
             #start of rotation is angle increasing and travsing 0, save crrent rotation and start a new one
             if prevSample[0] < sample[0] and prevSample[0] <= 0.0 and sample[0] > 0.0:
+                
                 #is a fiull rotation?
                 if abs(curRotation[1][-1][0]) < 0.5 and abs(curRotation[1][0][0]) < 0.5: #start and end angle are close to 0
                     curRotation[2] = curRotation[1][-1][1] - curRotation[0] #duration
@@ -66,17 +106,65 @@ def segment_data(data):
         prevSample = sample
     return rotations
 
+#thread function for data segmentation
+def segment_data_thread():
+    global rotations
+    global inbound
+    global lock_inbound
+    global lock_rotations
+    while(True):
+        lock_inbound.acquire()
+        samples = copy.deepcopy(inbound)
+        lock_inbound.release()
+        segment_data(samples)
+
+        lock_rotations.acquire()
+        newRotations = segment_data(samples)
+
+        #add new rotations to the global list
+        rotations.extend(newRotations)
+
+        print("rotations: " + str(len(rotations)))  
+        lock_rotations.release()
+        time.sleep(1)
+
+#thread function for calculating the reference rotation
+def reference_rotation_thread():
+    global reference_rotation
+    global lock_reference_rotation
+    global rotations
+    while(True):
+        curRotations = []
+        lock_rotations.acquire()
+        curRotations.extend(copy.deepcopy(rotations))
+        lock_rotations.release()
+
+        if(len(curRotations) < 10):
+            time.sleep(5)
+            continue
+
+        #find rotation with median duration
+        medianRotation = find_rotation_with_median_duration(curRotations)
+
+        #resample rotation
+        referenceRotation = resample_rotation(medianRotation)
+
+        #extend reference rotation
+        referenceRotation = extend_reference_rotation(referenceRotation, int(len(referenceRotation[1])*0.1))
+
+        #update reference rotation
+        lock_reference_rotation.acquire()
+        reference_rotation = referenceRotation
+        lock_reference_rotation.release()
+        time.sleep(30)
+
+
 
 def find_rotation_with_median_duration(rotations):
     rotations.sort(key=lambda x: x[2])
     return rotations[int(len(rotations)/2)]
 
 
-data = read_input()
-rotations = segment_data(data)
-print("rotations: " + str(len(rotations)))
-medianRotation = find_rotation_with_median_duration(rotations)
-print("median rotation duration: " + str(medianRotation[2]))
 
 def print_median_rotation(rotation):
     x = []
@@ -109,7 +197,7 @@ def resample_rotation(rotation, offset = 0):
     unevenAnglesNP = np.array(unevenAngles)
     evenTimestampsNP = np.arange(unevenTimestampsNP[0], unevenTimestampsNP[-1], sampleRate)
 
-    interpolation_function = interpolate.interp1d(unevenTimestampsNP, unevenAnglesNP, kind='linear')
+    interpolation_function = scipy.interpolate.interp1d(unevenTimestampsNP, unevenAnglesNP, kind='linear')
     evenly_resampled_values = interpolation_function(evenTimestampsNP)
 
     resampledRotation[0] = evenTimestampsNP
@@ -141,47 +229,7 @@ def slice_reference_rotation(referenceRotation, subRotation, maxMargin):
     
    
 
-
-
-def find_sub_rotation_lcss(referenceRotation, subRotation):
-    np.random.seed(0)
-    # Sample longer_time_series (reference time series)
-    longer_time_series = np.array(referenceRotation[1])
-    # Sample shorter_sub_time_series (sub-time series to match)
-    shorter_sub_time_series = np.array(subRotation[1])
-
-    dataset = tslearn.utils.to_time_series_dataset([longer_time_series, shorter_sub_time_series])
-    scaler = TimeSeriesScalerMeanVariance(mu=0., std=1.)  # Rescale time series
-    dataset_scaled = dataset #scaler.fit_transform(dataset)
-
-    s1 = dataset_scaled[0, :, 0]
-    s2 = dataset_scaled[1, :len(subRotation[1]), 0]
-
-    t1 = time.time()
-    lcss_path, sim_lcss = metrics.lcss_path(s1, s2, eps=.01)
-    print("lcss time: " + str(time.time() - t1))
-    #dtw_path, sim_dtw = metrics.dtw_path(s1, s2)
-
-    offset = lcss_path[0][0]
-
-    #plt.figure(1, figsize=(8, 8))
-
-    g1 = dataset_scaled[0, :, 0]
-    #plt.plot(g1, "b-", label='First time series')
-    g2 = dataset_scaled[1, :len(subRotation[1]), 0]
-    #plt.plot(g2, "g-", label='Second time series')
-
-    #for positions in lcss_path:
-    #    plt.plot([positions[0], positions[1]],
-    #            [dataset_scaled[0, positions[0], 0], dataset_scaled[1, positions[1], 0]], color='orange')
-    #plt.legend()
-    #plt.title("Time series matching with LCSS")
-
-    #plt.tight_layout()
-    #plt.show()
-    return offset
-
-def apply_dwt(longer_time_series, shorter_sub_time_series, i):
+def search_match_norm(longer_time_series, shorter_sub_time_series, i):
     long_x_aligned = []
     for j in range (0, len(shorter_sub_time_series)):
         #long_x_aligned.append([j, longer_time_series[i+j][0]])
@@ -194,90 +242,112 @@ def apply_dwt(longer_time_series, shorter_sub_time_series, i):
 
     return np.linalg.norm(np.array(short_x_aligned) - np.array(long_x_aligned)), None 
     
-    #c = np.correlate(long_x_aligned, short_x_aligned)
 
-    #subsequence = longer_time_series[i:i+len(shorter_sub_time_series)]
-    #return -c[0], None #fastdtw(long_x_aligned, short_x_aligned, dist=euclidean)
+def locate_sub_rotation(referenceRotation, timeStamps, angles, subRotationStart):
 
-
-def from_middle_dwt(longer_time_series, shorter_sub_time_series, start, end):
-    distance_l, path_s = apply_dwt(longer_time_series, shorter_sub_time_series, start + int(((end - start -10)/2)*0.9))
-    distance_r, path_e = apply_dwt(longer_time_series, shorter_sub_time_series, start + int(((end - start - 10)/2)*1.1))
-    distance_m, path_m = apply_dwt(longer_time_series, shorter_sub_time_series, start + int((end - start -10)/2))
-
-    d = None
-    best_distance = None
-    best_position = None
-    
-    if(distance_r <= distance_l):
-        d = 1
-        best_distance = distance_r
-        best_position = start + int(((end - start -10)/2)*1.1)
-    else:
-        d = -1
-        best_distance = distance_l
-        best_position = start + int(((end - start -10)/2)*0.9)
-
-    i = best_position
-    while(i > 0 and i < len(longer_time_series) - len(shorter_sub_time_series) + 1):
-        distance, path = apply_dwt(longer_time_series, shorter_sub_time_series, i)
-        if(distance <= best_distance):
-            best_distance = distance
-            best_position = i
-            i += d
-        else:
-            break
-    
-    
-    return best_position
-
-
-
-
-def find_sub_rotation_dtw(referenceRotation, subRotation):
-    np.random.seed(0)
-    # Sample longer_time_series (reference time series)
-    #longer_time_series = referenceRotation[1]
-    # Sample shorter_sub_time_series (sub-time series to match)
-    #shorter_sub_time_series = subRotation[1]
-
-    longer_time_series = []
-    for i in range (0, len(referenceRotation[1]) -1):
-        longer_time_series.append([referenceRotation[1][i], referenceRotation[0][i]])
-
-    
-    shorter_sub_time_series = []
-    for i in range (0, len(subRotation[1]) -1):
-        shorter_sub_time_series.append([subRotation[1][i], subRotation[0][i]])
-    
+  
     # Initialize variables to keep track of the best match
     best_distance = float('inf')
-    #best_position = from_middle_dwt(longer_time_series, shorter_sub_time_series, 0, len(longer_time_series) - len(shorter_sub_time_series) + 1 )
+    best_position = None
+    margin = 120 #max margin to search for a match
 
-    distance_a, path_a = apply_dwt(longer_time_series, shorter_sub_time_series, 130)
-    distance_b, path_b = apply_dwt(longer_time_series, shorter_sub_time_series, 200)
-    distance_c, path_c = apply_dwt(longer_time_series, shorter_sub_time_series, 0)
+    
+    #search with positive offset
+    for offset in range(-margin, margin):
+        distance = 0
+        curRefAngles = []
+        for i in range (0, len(timeStamps)):
+            curTimeStampInRef = (offset + timeStamps[i] - subRotationStart)
+            curAngleInRef = referenceRotation[1][curTimeStampInRef]
+            curRefAngles.append(curAngleInRef)
+        distance = np.linalg.norm(np.array(curRefAngles) - np.array(angles))
 
-    #return 130
+        # do the printing offset, distance, best_distance
+        #print(offset, distance, best_distance)
 
-    i = 0
-    while( i < len(longer_time_series) - len(shorter_sub_time_series) + 1):
-        distance, path = apply_dwt(longer_time_series, shorter_sub_time_series, i)
-        print("i:", i, "distance:", distance, "best_distance:", best_distance)
-        if(distance <= best_distance):
-            #print out i, distance, best_distance
-            
-            
+        if(distance < best_distance):
             best_distance = distance
-            best_position = i
-        i += 1
-        
+            best_position = offset
+
+   
 
 
     print("Best Match Position:", best_position)
     print("Best DTW Distance:", best_distance)
     
     return best_position
+
+
+def reverse_find_rotation_start(samples, startSampleIndex):
+    for i in range(startSampleIndex, 1, -1):
+        if samples[i-1][0] < samples[i][0] and samples[i-1][0] <= 0.0 and samples[i][0] > 0.0:
+            return i
+    return 0
+
+#thread function to estimate the position in the current rotation
+def estimate_position_thread():
+    #get the last 30 samples from the inbound queue
+    #resample the last 30 samples
+    #find the sub rotation in the reference rotation
+    #estimate the position in the current rotation
+    global reference_rotation
+    global lock_reference_rotation
+    global inbound
+    global lock_inbound
+    while(True):
+        samples = []
+        lock_inbound.acquire()
+        samples.extend(copy.deepcopy(inbound))
+        lock_inbound.release()
+
+        if(len(samples) < 30):
+            time.sleep(1)
+            continue
+
+
+
+
+        #resample the last 30 samples
+        lastSamples = samples[-30:]
+
+        unevenAngles = []
+        unevenTimestamps = []
+        for sample in lastSamples:
+            unevenAngles.append(sample[0])
+            unevenTimestamps.append(sample[1])
+
+        unevenTimestampsNP = np.array(unevenTimestamps)
+        unevenAnglesNP = np.array(unevenAngles)
+        evenTimestampsNP = np.arange(unevenTimestampsNP[0], unevenTimestampsNP[-1], sampleRate)
+
+        interpolation_function = scipy.interpolate.interp1d(unevenTimestampsNP, unevenAnglesNP, kind='linear')
+        evenly_resampled_values = interpolation_function(evenTimestampsNP)
+        
+
+        #find the sub rotation in the reference rotation
+        reference = None
+        lock_reference_rotation.acquire()
+        if(reference_rotation is not None):
+            reference = copy.deepcopy(reference_rotation)
+        lock_reference_rotation.release()
+        if(reference is None):
+            time.sleep(1)
+            continue
+        
+        rotation_start_index = reverse_find_rotation_start(samples, len(samples) - 1)
+        if(len(samples) - rotation_start_index) < 25:
+            time.sleep(1)
+            continue
+
+        rotation_start_ts = samples[rotation_start_index][1]
+
+
+        offset = locate_sub_rotation(reference, evenTimestampsNP, evenly_resampled_values, rotation_start_ts)
+
+        #todo: continue here correlating to local time
+
+        print("offset: " + str(offset))
+        time.sleep(1)
 
 
 
@@ -292,16 +362,18 @@ def test_find_sub_rotation(rotations, referceRotation):
     
     subRotationLength = 0.1 #sub rotation is 10% of the rotation
     #subRotationStart = 0.3 #random.random() * (1 - subRotationLength)
-    subRotationStart = random.random() * (1 - subRotationLength)
-    subRotation[1] = rotation[1][int( (len(rotation[1]) - 1) * subRotationStart ):
-                                 int( (len(rotation[1]) - 1) * (subRotationStart + subRotationLength))] 
+    subRotationStart = 0.99 #random.random() #* (1 - subRotationLength)
+    subRotationStartIndex = int( (len(rotation[1]) - 1) * subRotationStart )
+    subRotationEndIndex = int( (len(rotation[1]) - 1) * (subRotationStart + subRotationLength))
+    subRotation[1] = rotation[1][subRotationStartIndex:subRotationEndIndex] 
     
 
-    resampledSubRotation = resample_rotation(subRotation, 150)
+    resampledSubRotation = resample_rotation(subRotation, 0)
 
-    #offset = find_sub_rotation_lcss(slice_reference_rotation(referceRotation, resampledSubRotation, 200), resampledSubRotation)
-    offset = find_sub_rotation_dtw(slice_reference_rotation(referceRotation, resampledSubRotation, 200), resampledSubRotation)
-
+    t1 = time.time()
+    offset = locate_sub_rotation(referceRotation, resampledSubRotation[0], resampledSubRotation[1], 0)
+    t2 = time.time()
+    print("time: " + str(t2 - t1))
 
     #plot the refernce rotation and sub rotation into 1 plot
     x = referenceRotation[0] #time stamps
@@ -311,7 +383,7 @@ def test_find_sub_rotation(rotations, referceRotation):
     sr_xm = sr_x.copy()
 
     for i in range(0, len(sr_x)):
-        sr_xm[i] = sr_x[i] + offset * sampleRate -200
+        sr_xm[i] = sr_x[i] + offset * sampleRate 
 
         
     plt.plot(x, y, 'o', color='black', alpha=0.5)
@@ -319,7 +391,15 @@ def test_find_sub_rotation(rotations, referceRotation):
     plt.plot(sr_xm, sr_y, 'o', color='green', alpha=0.5)
     plt.show()
 
+#append the first n samples of the ration again to the back to model the wrap arround
+def extend_reference_rotation(referenceRotation, n):
+    extendedReferenceRotation = referenceRotation.copy()
+    extendedReferenceRotation[1] = np.append(extendedReferenceRotation[1], extendedReferenceRotation[1][0:n])
+    extendedReferenceRotation[0] = np.arange(0, len(extendedReferenceRotation[1]), sampleRate)
+    return extendedReferenceRotation
 
+
+    
 
 #plot data from each rotation as a line in a single plot
 def print_all_rotations(rotations):
@@ -336,10 +416,32 @@ def print_all_rotations(rotations):
             break
     plt.show()
 
-referenceRotation = resample_rotation(medianRotation)
+
+#data = read_input_from_CSV()
+#rotations = segment_data(data)
+#print("rotations: " + str(len(rotations)))
+#medianRotation = find_rotation_with_median_duration(rotations)
+#print("median rotation duration: " + str(medianRotation[2]))
+
+
+#referenceRotation = resample_rotation(medianRotation)
+#referenceRotation = extend_reference_rotation(referenceRotation, int(len(referenceRotation[1])*0.1))
+
+
+srvThread1 = threading.Thread(target=receive_sensor_data_udp)
+srvThread1.start()
+srvThread2 = threading.Thread(target=segment_data_thread)
+srvThread2.start()
+srvThread3 = threading.Thread(target=reference_rotation_thread)
+srvThread3.start()
+srvThread4 = threading.Thread(target=estimate_position_thread)
+srvThread4.start()
+
 #print_reference_rotation(referenceRotation)
 #print_median_rotation(medianRotation)
-test_find_sub_rotation(rotations, referenceRotation)
+#test_find_sub_rotation(rotations, referenceRotation)
 
+#sleep 30 sec
+time.sleep(300)
 
 print("done")
