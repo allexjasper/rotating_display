@@ -8,8 +8,18 @@ import numpy as np
 import random
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
+from scipy import interpolate
+from tslearn.clustering import TimeSeriesKMeans
+from tslearn.datasets import CachedDatasets
+from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 
+from tslearn.generators import random_walks
+from tslearn.preprocessing import TimeSeriesScalerMeanVariance
+from tslearn import metrics
+import tslearn
+import math
 
+sampleRate = 1
  
 # Using readlines()
 file1 = open('data\sample_data_out3V.csv', 'r')
@@ -79,156 +89,236 @@ def print_median_rotation(rotation):
     plt.show()
 
 
-def interpolate(start, end, timestampArray):
-    #compute gradient
-    gradient =  (timestampArray[end%len(timestampArray)][2] - timestampArray[start%len(timestampArray)][2] ) / (end - start)
-
-    #interpolate
-    i = start
-    while i < end:
-        timestampArray[i%len(timestampArray)][2] = timestampArray[start%len(timestampArray)][2] + (i - start) * gradient
-        i += 1
 
 #compute reference rotation from median rotation
-#create a evenly sampled rotation with the angles sampled at .001deg
-def compute_reference_rotation(rotation):
-    referenceRotation = [None, None, None, None, None] # time index, angle index, duration, max angle, min angle
-    
-    angleSample = [0, 0, 0] #angle (0.01 deg), gradient, relative sensor time stamp (ms)
-
-    #compute max and min angle from median rotation
-    maxAngle = 360
-    minAngle = -360
-    for sample in rotation[1]:
-        if sample[0] > maxAngle:
-            maxAngle = sample[0]
-        if sample[0] < minAngle:
-            minAngle = sample[0]
-
-    referenceRotation[3] = maxAngle
-    referenceRotation[4] = minAngle
-
+def resample_rotation(rotation, offset = 0):
+    resampledRotation = [None, None, None] # time stamp index, angles matching to time stampps, duration
 
     timestampIndexArray = [] #timestamp, gradient, angle  
 
-    #initialize timestamp index array
-    for i in range(0, int(rotation[2]) + 1):
-        timestampIndexArray.append([i, None, None]) #add timestamp to the timestamp index array with empty angle and gradient
 
+    unevenTimestamps = []
+    unevenAngles = []
     #add samples to timestamp index array
-    for sample in rotation[1]:    
-        timestampIndexArray[int(sample[1] - rotation[0])][2] = sample[0] #add sample angle to the timestamp index array
+    for sample in rotation[1]:
+        unevenTimestamps.append(sample[1] - rotation[0] - offset)
+        unevenAngles.append(sample[0])            
 
-    #interpolate missing angles
-    startInterpolationInterval = 0
-    endInterpolationInterval = 0
-    while startInterpolationInterval < len(timestampIndexArray):
-        if timestampIndexArray[startInterpolationInterval][2] is not None:
-            startInterpolationInterval += 1
-            continue
-        else:
-            endInterpolationInterval = startInterpolationInterval + 1
-            while endInterpolationInterval % len(timestampIndexArray) != startInterpolationInterval % len(timestampIndexArray):
-                if timestampIndexArray[endInterpolationInterval % len(timestampIndexArray)][2] is not None:
-                    break
-                endInterpolationInterval += 1
-        interpolate(startInterpolationInterval -1, endInterpolationInterval, timestampIndexArray)
+    #evenly resample using numpy
+    unevenTimestampsNP = np.array(unevenTimestamps)
+    unevenAnglesNP = np.array(unevenAngles)
+    evenTimestampsNP = np.arange(unevenTimestampsNP[0], unevenTimestampsNP[-1], sampleRate)
 
+    interpolation_function = interpolate.interp1d(unevenTimestampsNP, unevenAnglesNP, kind='linear')
+    evenly_resampled_values = interpolation_function(evenTimestampsNP)
 
-    #compute gradient
-    for i in range(0, len(timestampIndexArray)):
-        if timestampIndexArray[i][2] is not None:
-            if i > 0:
-                timestampIndexArray[i][1] = (timestampIndexArray[i][2] > timestampIndexArray[i-1][2])
-            else:
-                timestampIndexArray[i][1] = (timestampIndexArray[i][2] > timestampIndexArray[-1][2])
-
-    referenceRotation[0] = timestampIndexArray
-    return referenceRotation
-
-
-
-
-
-
-
-#find sub rotation in the reference rotation that matches the rotation using dynamic time warping, not  using the gradient
-def find_sub_rotation(referenceRotation, subRotation):
+    resampledRotation[0] = evenTimestampsNP
+    resampledRotation[1] = evenly_resampled_values
+    resampledRotation[2] = rotation[2]
     
-    #prepare fastdtw compliant time series out of reference rotation with (time, angle) tuples
-    referenceRotationAngles = []
-    for sample in referenceRotation[0]:
-        referenceRotationAngles.append([sample[0], sample[2]])
+    return resampledRotation
 
-    #prepare fastdtw compliant time series out of sub rotation with (time, angle) tuples
-    subRotationAngles = []
-    for sample in subRotation[1]:
-        subRotationAngles.append([sample[1] - subRotation[0], sample[0]])
+#extract matching candiadte ranges from reference rotation matcing withe margin of maxMargin
+#also add an additional iteration of the reference rotation if required
+def slice_reference_rotation(referenceRotation, subRotation, maxMargin):
+    firstSample = None
+    if(subRotation[0][0] > maxMargin):
+        firstSample = subRotation[0][0] - maxMargin
+    else:
+        firstSample = 0
+    
+    lastSample = None
+    if(subRotation[0][-1] + maxMargin < referenceRotation[0][-1]):
+        lastSample = subRotation[0][-1] + maxMargin
+    else:
+        lastSample = referenceRotation[0][-1]
+    
+    slicedReferenceRotation = referenceRotation.copy()
+    slicedReferenceRotation[0] = referenceRotation[0][int(firstSample/sampleRate):int(lastSample/sampleRate)]
+    slicedReferenceRotation[1] = referenceRotation[1][int(firstSample/sampleRate):int(lastSample/sampleRate)]
+
+    return slicedReferenceRotation
+    
+   
 
 
 
-    #compute the dynamic time warping distance between the sub rotation and the reference rotation
-    distance, path = fastdtw(referenceRotationAngles, subRotationAngles, dist=euclidean)
+def find_sub_rotation_lcss(referenceRotation, subRotation):
+    np.random.seed(0)
+    # Sample longer_time_series (reference time series)
+    longer_time_series = np.array(referenceRotation[1])
+    # Sample shorter_sub_time_series (sub-time series to match)
+    shorter_sub_time_series = np.array(subRotation[1])
 
-    #derive out of the return from fastdtw the time offset between the sub rotation and the reference rotation
-    timeOffset = path[-1][0] - path[0][0]
+    dataset = tslearn.utils.to_time_series_dataset([longer_time_series, shorter_sub_time_series])
+    scaler = TimeSeriesScalerMeanVariance(mu=0., std=1.)  # Rescale time series
+    dataset_scaled = dataset #scaler.fit_transform(dataset)
+
+    s1 = dataset_scaled[0, :, 0]
+    s2 = dataset_scaled[1, :len(subRotation[1]), 0]
+
+    t1 = time.time()
+    lcss_path, sim_lcss = metrics.lcss_path(s1, s2, eps=.01)
+    print("lcss time: " + str(time.time() - t1))
+    #dtw_path, sim_dtw = metrics.dtw_path(s1, s2)
+
+    offset = lcss_path[0][0]
+
+    #plt.figure(1, figsize=(8, 8))
+
+    g1 = dataset_scaled[0, :, 0]
+    #plt.plot(g1, "b-", label='First time series')
+    g2 = dataset_scaled[1, :len(subRotation[1]), 0]
+    #plt.plot(g2, "g-", label='Second time series')
+
+    #for positions in lcss_path:
+    #    plt.plot([positions[0], positions[1]],
+    #            [dataset_scaled[0, positions[0], 0], dataset_scaled[1, positions[1], 0]], color='orange')
+    #plt.legend()
+    #plt.title("Time series matching with LCSS")
+
+    #plt.tight_layout()
+    #plt.show()
+    return offset
+
+def apply_dwt(longer_time_series, shorter_sub_time_series, i):
+    long_x_aligned = []
+    for j in range (0, len(shorter_sub_time_series)):
+        #long_x_aligned.append([j, longer_time_series[i+j][0]])
+        long_x_aligned.append(longer_time_series[i+j][0])
+
+    short_x_aligned = []
+    for j in range (0, len(shorter_sub_time_series)):
+        #short_x_aligned.append([j, shorter_sub_time_series[j][0]])
+        short_x_aligned.append(shorter_sub_time_series[j][0])
+
+    return np.linalg.norm(np.array(short_x_aligned) - np.array(long_x_aligned)), None 
+    
+    #c = np.correlate(long_x_aligned, short_x_aligned)
+
+    #subsequence = longer_time_series[i:i+len(shorter_sub_time_series)]
+    #return -c[0], None #fastdtw(long_x_aligned, short_x_aligned, dist=euclidean)
+
+
+def from_middle_dwt(longer_time_series, shorter_sub_time_series, start, end):
+    distance_l, path_s = apply_dwt(longer_time_series, shorter_sub_time_series, start + int(((end - start -10)/2)*0.9))
+    distance_r, path_e = apply_dwt(longer_time_series, shorter_sub_time_series, start + int(((end - start - 10)/2)*1.1))
+    distance_m, path_m = apply_dwt(longer_time_series, shorter_sub_time_series, start + int((end - start -10)/2))
+
+    d = None
+    best_distance = None
+    best_position = None
+    
+    if(distance_r <= distance_l):
+        d = 1
+        best_distance = distance_r
+        best_position = start + int(((end - start -10)/2)*1.1)
+    else:
+        d = -1
+        best_distance = distance_l
+        best_position = start + int(((end - start -10)/2)*0.9)
+
+    i = best_position
+    while(i > 0 and i < len(longer_time_series) - len(shorter_sub_time_series) + 1):
+        distance, path = apply_dwt(longer_time_series, shorter_sub_time_series, i)
+        if(distance <= best_distance):
+            best_distance = distance
+            best_position = i
+            i += d
+        else:
+            break
+    
+    
+    return best_position
 
 
 
 
-    #print the distance and the path
-    print("distance: " + str(distance))
-    print("path: " + str(path))   
+def find_sub_rotation_dtw(referenceRotation, subRotation):
+    np.random.seed(0)
+    # Sample longer_time_series (reference time series)
+    #longer_time_series = referenceRotation[1]
+    # Sample shorter_sub_time_series (sub-time series to match)
+    #shorter_sub_time_series = subRotation[1]
+
+    longer_time_series = []
+    for i in range (0, len(referenceRotation[1]) -1):
+        longer_time_series.append([referenceRotation[1][i], referenceRotation[0][i]])
+
+    
+    shorter_sub_time_series = []
+    for i in range (0, len(subRotation[1]) -1):
+        shorter_sub_time_series.append([subRotation[1][i], subRotation[0][i]])
+    
+    # Initialize variables to keep track of the best match
+    best_distance = float('inf')
+    #best_position = from_middle_dwt(longer_time_series, shorter_sub_time_series, 0, len(longer_time_series) - len(shorter_sub_time_series) + 1 )
+
+    distance_a, path_a = apply_dwt(longer_time_series, shorter_sub_time_series, 130)
+    distance_b, path_b = apply_dwt(longer_time_series, shorter_sub_time_series, 200)
+    distance_c, path_c = apply_dwt(longer_time_series, shorter_sub_time_series, 0)
+
+    #return 130
+
+    i = 0
+    while( i < len(longer_time_series) - len(shorter_sub_time_series) + 1):
+        distance, path = apply_dwt(longer_time_series, shorter_sub_time_series, i)
+        print("i:", i, "distance:", distance, "best_distance:", best_distance)
+        if(distance <= best_distance):
+            #print out i, distance, best_distance
+            
+            
+            best_distance = distance
+            best_position = i
+        i += 1
+        
+
+
+    print("Best Match Position:", best_position)
+    print("Best DTW Distance:", best_distance)
+    
+    return best_position
+
+
 
 
 #test the curve matching my slecting a random rotation and random sub rotation, ploting them and then calling find_sub_rotation
 #to match the sub rotation to the refernce rotation
 def test_find_sub_rotation(rotations, referceRotation):
-    rotation = rotations[random.randint(0, len(rotations) - 1)]
+    #selRotation = 42 #random.randint(0, len(rotations) - 1)
+    selRotation = random.randint(0, len(rotations) - 1)
+    rotation = rotations[selRotation]
     subRotation = rotation.copy()
     
-    #randomly choose a float between 0 and 0.9
     subRotationLength = 0.1 #sub rotation is 10% of the rotation
+    #subRotationStart = 0.3 #random.random() * (1 - subRotationLength)
     subRotationStart = random.random() * (1 - subRotationLength)
-    
-    #subRotation[1] = rotation[1][random.randint(0, int(len(rotation[1])*0.3) - 1):random.randint(int(len(rotation[1]) * 0.4), len(rotation[1]) - 1)]
     subRotation[1] = rotation[1][int( (len(rotation[1]) - 1) * subRotationStart ):
                                  int( (len(rotation[1]) - 1) * (subRotationStart + subRotationLength))] 
-
-    find_sub_rotation(referceRotation, subRotation)
     
+
+    resampledSubRotation = resample_rotation(subRotation, 150)
+
+    #offset = find_sub_rotation_lcss(slice_reference_rotation(referceRotation, resampledSubRotation, 200), resampledSubRotation)
+    offset = find_sub_rotation_dtw(slice_reference_rotation(referceRotation, resampledSubRotation, 200), resampledSubRotation)
+
+
     #plot the refernce rotation and sub rotation into 1 plot
-    x = []
-    y = []
-    sr_x = []
-    sr_y = []
+    x = referenceRotation[0] #time stamps
+    y = referenceRotation[1] #angles
+    sr_x = resampledSubRotation[0] #time stamps
+    sr_y = resampledSubRotation[1] #angles
+    sr_xm = sr_x.copy()
 
-    for sample in referceRotation[0]:
-        x.append(sample[0])
-        y.append(sample[2])
+    for i in range(0, len(sr_x)):
+        sr_xm[i] = sr_x[i] + offset * sampleRate -200
 
-    for sample in subRotation[1]:
-        sr_x.append(sample[1] - rotation[0] - 300)
-        sr_y.append(sample[0])
         
     plt.plot(x, y, 'o', color='black', alpha=0.5)
     plt.plot(sr_x, sr_y, 'o', color='red', alpha=0.5)
+    plt.plot(sr_xm, sr_y, 'o', color='green', alpha=0.5)
     plt.show()
 
-
-
-#plot reference rotation
-def print_reference_rotation(referenceRotation):
-    x = []
-    y = []
-    g = []
-    for sample in referenceRotation[0]:
-        x.append(sample[0])
-        g.append(sample[1])
-        y.append(sample[2])
-    plt.plot(x, y, 'o', color='blue', alpha=0.5)
-    plt.plot(x, g, 'o', color='red', alpha=0.5)
-    plt.show()
 
 
 #plot data from each rotation as a line in a single plot
@@ -246,7 +336,7 @@ def print_all_rotations(rotations):
             break
     plt.show()
 
-referenceRotation = compute_reference_rotation(medianRotation)
+referenceRotation = resample_rotation(medianRotation)
 #print_reference_rotation(referenceRotation)
 #print_median_rotation(medianRotation)
 test_find_sub_rotation(rotations, referenceRotation)
