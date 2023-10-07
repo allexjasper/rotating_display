@@ -10,6 +10,7 @@ import scipy.interpolate
 import threading
 import collections
 import copy
+import statistics
 
 sampleRate = 1
 
@@ -25,10 +26,11 @@ inbound = collections.deque(maxlen=20000) #inbound queue of samlpes (angle, sens
 lock_inbound = threading.Lock()
 rotations = collections.deque(maxlen=100)
 lock_rotations = threading.Lock()
-sensor_time_offset = 0 #time offset between sensor and local time
+clock_offset = None #time offset between sensor and local time
 transmission_delay = 10 
 reference_rotation = None #current reference roation
 lock_reference_rotation = threading.Lock()
+reference_rotation_local_time_pair = [None,None] #reference rotation, sensor time stamp
 
 
 
@@ -79,6 +81,34 @@ def read_input_from_CSV():
         tuple[2] = int(match.group(3))
         data.append(tuple)
     return data
+
+
+def calculate_clock_offset():
+    global inbound
+    global lock_inbound
+    global clock_offset
+    
+    with lock_inbound:
+        # get the last 50 samples from inbound
+        last_50_samples = list(inbound)[-50:]
+
+    # calculate the time differences between sensor and local time for each sample
+    time_differences = [sample[1] - sample[2] for sample in last_50_samples]
+
+    if len(time_differences) == 0:
+        return
+
+    # calculate the median time difference
+    median_time_difference = statistics.median(time_differences)
+
+    # the absolute value of the median time difference is the estimated time offset
+    clock_offset = median_time_difference
+
+def start_offset_thread():
+    # call calculate_offset every 5 minutes
+    while(True):
+        calculate_clock_offset()
+        time.sleep(5)
 
 #segment data in samplesDeq into rotations
 def segment_data(data):
@@ -156,7 +186,7 @@ def reference_rotation_thread():
         lock_reference_rotation.acquire()
         reference_rotation = referenceRotation
         lock_reference_rotation.release()
-        time.sleep(30)
+        time.sleep(3000)
 
 
 
@@ -344,7 +374,11 @@ def estimate_position_thread():
 
         offset = locate_sub_rotation(reference, evenTimestampsNP, evenly_resampled_values, rotation_start_ts)
 
+                
         #todo: continue here correlating to local time
+        reference_rotation_local_time_pair[0] = (offset + evenTimestampsNP[-1] - rotation_start_ts)
+        #reference_rotation_local_time_pair[1] = evenTimestampsNP[-1]
+        reference_rotation_local_time_pair[1] = samples[-1][2] #local time stamp of the last sample
 
         print("offset: " + str(offset))
         time.sleep(1)
@@ -417,6 +451,59 @@ def print_all_rotations(rotations):
     plt.show()
 
 
+lock_reder = threading.Lock()
+render_x = []
+render_raw = []
+render_ref = []
+
+def render_thread():
+    latestSample = None
+
+    while(True):
+        lock_inbound.acquire()
+        
+        if len(inbound) > 1:
+            latestSample = inbound[-1]
+        lock_inbound.release()
+
+        if latestSample is None or reference_rotation_local_time_pair[1] is None:
+            time.sleep(1)
+            continue
+
+        #project the sample 10ms into the future using the reference rotation
+        
+        timeDiff = latestSample[1] - reference_rotation_local_time_pair[1] # deleta in sensor time domain
+        lock_reference_rotation.acquire()
+        if reference_rotation is not None:
+            ind = (timeDiff + transmission_delay)% len(reference_rotation[1])
+            angle = reference_rotation[1][ind]
+        lock_reference_rotation.release()
+
+        lock_reder.acquire()
+        render_x.append(latestSample[2])
+        render_raw.append(latestSample[0])
+        render_ref.append(angle)
+        lock_reder.release()
+        time.sleep(0.1)
+
+
+
+def plot_thread():
+    global render_x
+    global render_raw
+    global render_ref
+    while(True):
+        lock_reder.acquire()
+        x = render_x.copy()
+        raw = render_raw.copy()
+        ref = render_ref.copy()
+        lock_reder.release()
+        plt.plot(x, raw, '-', color='red')
+        plt.plot(x, ref, '-', color='green')
+        plt.show()
+        time.sleep(20)
+
+
 #data = read_input_from_CSV()
 #rotations = segment_data(data)
 #print("rotations: " + str(len(rotations)))
@@ -436,10 +523,18 @@ srvThread3 = threading.Thread(target=reference_rotation_thread)
 srvThread3.start()
 srvThread4 = threading.Thread(target=estimate_position_thread)
 srvThread4.start()
+srvThread5 = threading.Thread(target=calculate_clock_offset)
+srvThread5.start()
+srvThread5 = threading.Thread(target=render_thread)
+srvThread5.start()
+srvThread6 = threading.Thread(target=plot_thread)
+srvThread6.start()
 
 #print_reference_rotation(referenceRotation)
 #print_median_rotation(medianRotation)
 #test_find_sub_rotation(rotations, referenceRotation)
+
+#plot_thread()
 
 #sleep 30 sec
 time.sleep(300)
