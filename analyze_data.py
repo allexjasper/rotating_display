@@ -14,7 +14,7 @@ import statistics
 
 sampleRate = 1
 
-magnetOffset = 321520
+magnetOffset = 100000 #321520
  
 # Using readlines()
 file1 = open('data\sample_data_out3V.csv', 'r')
@@ -27,7 +27,7 @@ lock_inbound = threading.Lock()
 rotations = collections.deque(maxlen=100)
 lock_rotations = threading.Lock()
 clock_offset = None #time offset between sensor and local time
-transmission_delay = 10 
+transmission_delay = 50
 reference_rotation = None #current reference roation
 lock_reference_rotation = threading.Lock()
 reference_rotation_local_time_pair = [None,None] #reference rotation, sensor time stamp
@@ -95,19 +95,20 @@ def calculate_clock_offset():
     # calculate the time differences between sensor and local time for each sample
     time_differences = [sample[1] - sample[2] for sample in last_50_samples]
 
-    if len(time_differences) == 0:
+    if len(time_differences) < 10:
         return
 
     # calculate the median time difference
     median_time_difference = statistics.median(time_differences)
 
     # the absolute value of the median time difference is the estimated time offset
-    clock_offset = median_time_difference
+    clock_offset = int(median_time_difference)
 
 def start_offset_thread():
     # call calculate_offset every 5 minutes
     while(True):
-        calculate_clock_offset()
+        if(clock_offset is  None):
+            calculate_clock_offset()
         time.sleep(5)
 
 #segment data in samplesDeq into rotations
@@ -184,7 +185,8 @@ def reference_rotation_thread():
 
         #update reference rotation
         lock_reference_rotation.acquire()
-        reference_rotation = referenceRotation
+        if(reference_rotation is None):
+            reference_rotation = referenceRotation
         lock_reference_rotation.release()
         time.sleep(3000)
 
@@ -235,28 +237,6 @@ def resample_rotation(rotation, offset = 0):
     resampledRotation[2] = rotation[2]
     
     return resampledRotation
-
-#extract matching candiadte ranges from reference rotation matcing withe margin of maxMargin
-#also add an additional iteration of the reference rotation if required
-def slice_reference_rotation(referenceRotation, subRotation, maxMargin):
-    firstSample = None
-    if(subRotation[0][0] > maxMargin):
-        firstSample = subRotation[0][0] - maxMargin
-    else:
-        firstSample = 0
-    
-    lastSample = None
-    if(subRotation[0][-1] + maxMargin < referenceRotation[0][-1]):
-        lastSample = subRotation[0][-1] + maxMargin
-    else:
-        lastSample = referenceRotation[0][-1]
-    
-    slicedReferenceRotation = referenceRotation.copy()
-    slicedReferenceRotation[0] = referenceRotation[0][int(firstSample/sampleRate):int(lastSample/sampleRate)]
-    slicedReferenceRotation[1] = referenceRotation[1][int(firstSample/sampleRate):int(lastSample/sampleRate)]
-
-    return slicedReferenceRotation
-    
    
 
 def search_match_norm(longer_time_series, shorter_sub_time_series, i):
@@ -324,6 +304,7 @@ def estimate_position_thread():
     global lock_reference_rotation
     global inbound
     global lock_inbound
+    loopnum = 0
     while(True):
         samples = []
         lock_inbound.acquire()
@@ -348,7 +329,7 @@ def estimate_position_thread():
 
         unevenTimestampsNP = np.array(unevenTimestamps)
         unevenAnglesNP = np.array(unevenAngles)
-        evenTimestampsNP = np.arange(unevenTimestampsNP[0], unevenTimestampsNP[-1], sampleRate)
+        evenTimestampsNP = np.arange(unevenTimestampsNP[0], unevenTimestampsNP[-1] -1, sampleRate)
 
         interpolation_function = scipy.interpolate.interp1d(unevenTimestampsNP, unevenAnglesNP, kind='linear')
         evenly_resampled_values = interpolation_function(evenTimestampsNP)
@@ -365,7 +346,7 @@ def estimate_position_thread():
             continue
         
         rotation_start_index = reverse_find_rotation_start(samples, len(samples) - 1)
-        if(len(samples) - rotation_start_index) < 25:
+        if(len(samples) - rotation_start_index) < 200:
             time.sleep(1)
             continue
 
@@ -381,9 +362,24 @@ def estimate_position_thread():
         reference_rotation_local_time_pair[1] = samples[-1][2] #local time stamp of the last sample
 
         print("offset: " + str(offset))
-        time.sleep(1)
 
+        #plot the refernce rotation and sub rotation into 1 plot
+        #x = reference[0] #time stamps
+        #y = reference[1] #angles
+        #sr_x = evenTimestampsNP #time stamps
+        #sr_y = evenly_resampled_values #angles
+        #sr_xm = sr_x.copy()
 
+        #for i in range(0, len(sr_x)):
+        #    sr_xm[i] = sr_x[i] + offset * sampleRate 
+
+        #fig, ax = plt.subplots()
+        #plt.plot(x, y, 'o', color='black', alpha=0.5)
+        #plt.plot(sr_x, sr_y, 'o', color='red', alpha=0.5)
+        #plt.plot(sr_xm, sr_y, 'o', color='green', alpha=0.5)
+        #plt.savefig('match' + str(loopnum) + '.png')
+        time.sleep(5)
+        loopnum += 1
 
 
 #test the curve matching my slecting a random rotation and random sub rotation, ploting them and then calling find_sub_rotation
@@ -466,16 +462,16 @@ def render_thread():
             latestSample = inbound[-1]
         lock_inbound.release()
 
-        if latestSample is None or reference_rotation_local_time_pair[1] is None:
+        if latestSample is None or reference_rotation_local_time_pair[1] is None or clock_offset is None:
             time.sleep(1)
             continue
 
         #project the sample 10ms into the future using the reference rotation
         
-        timeDiff = latestSample[1] - reference_rotation_local_time_pair[1] # deleta in sensor time domain
+        timeDiff = latestSample[2] - reference_rotation_local_time_pair[1] + clock_offset
         lock_reference_rotation.acquire()
         if reference_rotation is not None:
-            ind = (timeDiff + transmission_delay)% len(reference_rotation[1])
+            ind = (reference_rotation_local_time_pair[0] + timeDiff + transmission_delay)% reference_rotation[2]
             angle = reference_rotation[1][ind]
         lock_reference_rotation.release()
 
@@ -492,16 +488,26 @@ def plot_thread():
     global render_x
     global render_raw
     global render_ref
+    i = 0
     while(True):
+        fig, ax = plt.subplots()
         lock_reder.acquire()
         x = render_x.copy()
+        print( len(x))
         raw = render_raw.copy()
         ref = render_ref.copy()
+        render_x.clear()
+        render_raw.clear()
+        render_ref.clear()
         lock_reder.release()
         plt.plot(x, raw, '-', color='red')
         plt.plot(x, ref, '-', color='green')
-        plt.show()
-        time.sleep(20)
+        plt.savefig('plot' + str(i) + '.png')
+        
+
+        #plt.show()
+        time.sleep(1)
+        i += 1
 
 
 #data = read_input_from_CSV()
@@ -523,18 +529,19 @@ srvThread3 = threading.Thread(target=reference_rotation_thread)
 srvThread3.start()
 srvThread4 = threading.Thread(target=estimate_position_thread)
 srvThread4.start()
-srvThread5 = threading.Thread(target=calculate_clock_offset)
+srvThread5 = threading.Thread(target=start_offset_thread)
 srvThread5.start()
 srvThread5 = threading.Thread(target=render_thread)
 srvThread5.start()
-srvThread6 = threading.Thread(target=plot_thread)
-srvThread6.start()
+#srvThread6 = threading.Thread(target=plot_thread)
+#srvThread6.start()
 
 #print_reference_rotation(referenceRotation)
 #print_median_rotation(medianRotation)
 #test_find_sub_rotation(rotations, referenceRotation)
 
-#plot_thread()
+plot_thread()
+
 
 #sleep 30 sec
 time.sleep(300)
