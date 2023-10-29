@@ -17,10 +17,24 @@
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include <windows.h>
+#include <boost/log/core.hpp>
+#include <boost/log/expressions.hpp>
+#include <boost/log/sources/logger.hpp>
+#include <boost/log/sources/severity_logger.hpp>
+#include <boost/log/sources/record_ostream.hpp>
+#include <boost/log/utility/setup/file.hpp>
+#include <boost/log/utility/setup/common_attributes.hpp>
+#include <boost/log/trivial.hpp>
+
+
 
 using namespace boost::asio;
 using namespace std;
 namespace po = boost::program_options;
+namespace logging = boost::log;
+namespace src = boost::log::sources;
+namespace sinks = boost::log::sinks;
+namespace keywords = boost::log::keywords;
 
 
 const size_t inboundBufferSize = 20000; // Modify as needed
@@ -32,7 +46,18 @@ typedef std::tuple<float, Timestamp, Timestamp> Sample; // angle, sensor time, l
 typedef  std::vector<Sample>  RawData;
 typedef  std::deque<Sample>  RawDataDeueue;
 
+src::severity_logger< logging::trivial::severity_level > lg;
 
+// Initialize Boost::Log
+void initLogging() {
+    logging::add_file_log
+    (
+        keywords::file_name = "rotating_display_%N.log",
+        keywords::rotation_size = 10 * 1024 * 1024,
+        keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0),
+        keywords::format = "[%TimeStamp%]: %Message%"
+    );
+}
 
 
 
@@ -61,6 +86,42 @@ public:
     std::chrono::milliseconds duration() const {
         return _duration;//std::chrono::duration_cast<std::chrono::milliseconds>(std::get<1>(samples.back()) - std::get<1>(samples.front()));
     }
+
+    // compute mediant of vecotr of floats
+    static float median(std::vector<float> v)
+    {
+		size_t n = v.size() / 2;
+		std::nth_element(v.begin(), v.begin() + n, v.end());
+		return v[n];
+	}
+
+    static AngleTimeSeries computeAverageTimeSeries(const std::vector<AngleTimeSeries>& input)
+    {
+        AngleTimeSeries averageTimeSeries;
+        
+		// Compute the average time series
+        auto s = input.front().samples.size();
+		averageTimeSeries.samples.resize(s);
+        for (size_t i = 0; i < averageTimeSeries.samples.size(); i++)
+        {
+            std::vector<float> angles;
+			
+            for (const AngleTimeSeries& timeSeries : input)
+            {
+                if (timeSeries.samples.size() > i)
+                {
+					angles.push_back(std::get<0>(timeSeries.samples[i]));
+				}
+			}
+
+			averageTimeSeries.samples[i] = Sample(median(angles), std::get<1>(input.front().samples[i]), std::get<2>(input.front().samples[i]));
+		
+		}
+        averageTimeSeries._duration = input.front().duration();
+		return averageTimeSeries;
+    }
+
+
 
 
     // Resample the rotation data to evenly space 1 ms buckets with interpolation
@@ -115,7 +176,7 @@ public:
             return; // Nothing to extend
         }
 
-        size_t extensionSize = static_cast<size_t>(samples.size() * 0.2); // Extend by 20%
+        size_t extensionSize = 40;//static_cast<size_t>(samples.size() * 0.5); // Extend by 20%
 
 
         // Extract the first 'extensionSize' samples for extension
@@ -128,8 +189,10 @@ public:
 
         // Adjust timestamps of the extension samples
         for (Sample& sample : extensionSamples) {
-            std::get<1>(sample) += duration;
-            std::get<2>(sample) += duration;
+            //std::get<1>(sample) += duration - std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::milliseconds(10));
+            //std::get<2>(sample) += duration - std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::milliseconds(10));
+            std::get<1>(sample) += duration - std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::milliseconds(10));
+            std::get<2>(sample) += duration - std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::milliseconds(10));
         }
 
         // Add the extension samples to the end of the rotation
@@ -147,6 +210,25 @@ public:
         for (const Sample& sample : samples) {
             // Format the data as "timestamp angle"
             outputFile << std::get<1>(sample).time_since_epoch().count() << " " << std::get<0>(sample) << std::endl;
+        }
+
+        outputFile.close();
+    }
+
+    void generateGnuplotDataFileWithMatch(const std::string& filename, const AngleTimeSeries& shorter_sub_time_series, int offset) {
+        std::ofstream outputFile(filename);
+        if (!outputFile.is_open()) {
+            std::cerr << "Failed to open the file for writing: " << filename << std::endl;
+            return;
+        }
+
+        for (int i = 0; i < samples.size(); i++) {
+            // Format the data as "timestamp angle"
+            auto sample = samples[i];
+            if(i >= offset && i < offset + shorter_sub_time_series.samples.size())
+                outputFile << std::get<1>(sample).time_since_epoch().count() << " " << std::get<0>(sample) << " " << std::get<0>(shorter_sub_time_series.samples[i - offset]) << std::endl;
+			else
+                outputFile << std::get<1>(sample).time_since_epoch().count() << " " << std::get<0>(sample) << std::endl;
         }
 
         outputFile.close();
@@ -177,7 +259,7 @@ public:
     // Store the last N samples and resample
     void storeAndResampleLastNSamples(const RawData& inboundData, int numSamplesToStore) {
         if (inboundData.size() < numSamplesToStore) {
-            std::cerr << "Not enough samples to estimate position." << std::endl;
+            BOOST_LOG_TRIVIAL(error) << "Not enough samples to estimate position.";
             return;
         }
 
@@ -312,14 +394,14 @@ vector<AngleTimeSeries> segment_data(const RawData& data) {
     }
 
     // Print the min and max angles
-    std::cout << "Min Angle: " << minAngle << std::endl;
-    std::cout << "Max Angle: " << maxAngle << std::endl;
+    BOOST_LOG_TRIVIAL(info) << "min angle observed while segmenting: " << minAngle << std::endl;
+    BOOST_LOG_TRIVIAL(info) << "max angle: observed while segmenting: " << maxAngle << std::endl;
 
     return rotations;
 }
 
 
-AngleTimeSeries findRotationWithMedianDuration(const vector<AngleTimeSeries>& rotations) {
+AngleTimeSeries findNMedianDuration(const vector<AngleTimeSeries>& rotations, int n) {
     if (rotations.empty()) {
         throw runtime_error("No rotations to find the median duration from.");
     }
@@ -332,7 +414,10 @@ AngleTimeSeries findRotationWithMedianDuration(const vector<AngleTimeSeries>& ro
 		return a.duration() < b.duration();
 	});
 
-    return rotations_copy[rotations_copy.size() / 2]; // Return the rotation with the median duration
+    std::vector<AngleTimeSeries> rotations_median(rotations_copy.begin() + rotations_copy.size() / 2 - n / 2, rotations_copy.begin() + rotations_copy.size() / 2 + n / 2);
+    return AngleTimeSeries::computeAverageTimeSeries(rotations_median);
+
+    //return rotations_copy[rotations_copy.size() / 2]; // Return the rotation with the median duration
 }
 
 
@@ -346,66 +431,34 @@ void segment_data_periodically() {
             rd.assign(inbound.begin(), inbound.end());
         }
         std::vector<AngleTimeSeries> rotations = segment_data(rd);
-        if (rotations.size() == 0) {
+        if (rotations.size() < 10) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             continue;
 		}
 
-        AngleTimeSeries reference_rotation_local = findRotationWithMedianDuration(rotations);
+        
+        AngleTimeSeries reference_rotation_local = findNMedianDuration(rotations, 5);
         reference_rotation_local.makeSensorTimestampsRelative();
         reference_rotation_local.extendRotation();
         reference_rotation_local.resample();
         reference_rotation_local.generateGnuplotDataFile("reference_rotation.dat");
         
         {
+            BOOST_LOG_TRIVIAL(info) << "Reference rotation duration: " << reference_rotation_local.duration().count() << " ms" << std::endl;
 			std::lock_guard<std::mutex> guard(lock_referenceRotation);
 			//if(!referenceRotation.has_value()) // todo: activate later update of reference rotation
                 referenceRotation = reference_rotation_local;
 		}
 
-        std::this_thread::sleep_for(std::chrono::seconds(500));
+        std::this_thread::sleep_for(std::chrono::seconds(10));
     }
 }
 
-
-void calculate_min_max_center() {
-    std::lock_guard<std::mutex> guard(lock_inbound);
-
-    // Extract angles from samples and store them in a separate vector
-    std::vector<float> angles;
-    for (const auto& sample : inbound) {
-        angles.push_back(std::get<0>(sample));
-    }
-
-    if (angles.empty()) {
-        // No data to process
-        return;
-    }
-
-    // Sort the angles
-    std::sort(angles.begin(), angles.end());
-
-    // Calculate the index for ignoring 1% of outliers
-    size_t start_index = static_cast<size_t>(angles.size() * 0.01);
-    size_t end_index = angles.size() - start_index;
-
-    // Calculate the minimum and maximum after ignoring outliers
-    float min_angle = angles[start_index];
-    float max_angle = angles[end_index - 1];
-
-    // Calculate the center value between min and max
-    float center_angle = (min_angle + max_angle) / 2;
-
-    // Print the results
-    std::cout << "Min Angle: " << min_angle << std::endl;
-    std::cout << "Max Angle: " << max_angle << std::endl;
-    std::cout << "Center Angle: " << center_angle << std::endl;
-}
-
+int numMatches = 0;
 
 // Function to perform position estimation every 5 seconds
 void performPositionEstimationPeriodically() {
-    int numSamplesToStore = 50; // Modify as needed
+    int numSamplesToStore = 20; // about 500 ms of data
     AngleTimeSeries angleTimeSeries;
     while (true) {
         RawData inboundDataCopy;
@@ -420,20 +473,28 @@ void performPositionEstimationPeriodically() {
             referenceRotationCopy = referenceRotation;
 		}
 
-        // Store and resample the last N samples
-        angleTimeSeries.storeAndResampleLastNSamples(inboundDataCopy, numSamplesToStore);
+        
 
         // Estimate position using the reference rotation
         if (!referenceRotationCopy.has_value())
         {
-			std::cout << "Reference rotation is not available yet." << std::endl;
+            BOOST_LOG_TRIVIAL(trace) << "Reference rotation is not available yet.";
 		}
         else
         {
+            // Store and resample the last N samples
+            angleTimeSeries.storeAndResampleLastNSamples(inboundDataCopy, numSamplesToStore);
+
             std::pair<float, int> result = angleTimeSeries.estimate_position(*referenceRotationCopy);
 
             // Display the result (you can replace this with your specific processing)
-            std::cout << "Estimated Position: Norm = " << result.first << ", Index = " << result.second << std::endl;
+            BOOST_LOG_TRIVIAL(trace) << "Estimated Position: Norm = " << result.first << ", Index = " << result.second
+                                                                      << " num match =" << numMatches << ::endl;
+
+            // Generate gnuplot data file for the reference rotation and the inbound data
+            std::string numStr = boost::lexical_cast<std::string>(numMatches);
+            //referenceRotationCopy->generateGnuplotDataFileWithMatch("inbound_data_with_match_" + numStr, angleTimeSeries, result.second);
+            numMatches++;
 
             RefRotationToLocal ref_rotation_to_local_local;
             ref_rotation_to_local_local.reference_rotation = *referenceRotationCopy;
@@ -445,7 +506,7 @@ void performPositionEstimationPeriodically() {
         }
 
         // Sleep for 5 seconds before the next estimation
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
@@ -644,6 +705,9 @@ int render_opengl()
         SDL_Delay(10); // Equivalent to pygame.time.wait(10)
 
         // Update angle or other logic as needed
+        if(std::abs(angle - prevAngle) > 0.5)
+			BOOST_LOG_TRIVIAL(trace) << "Angle jump: " << angle - prevAngle << std::endl;
+
         prevAngle = angle;
         // Add your logic here to update 'angle'
     }
@@ -659,6 +723,15 @@ int render_opengl()
 
 
 int main(int argc, char** argv) {
+
+    // Initialize logging
+    initLogging();
+    logging::add_common_attributes();
+
+    
+    BOOST_LOG_TRIVIAL(trace) << "Client starting";
+    
+
     float magnet_offset;
     int time_offset;  // Change to integer
 
@@ -672,11 +745,11 @@ int main(int argc, char** argv) {
     po::notify(vm);
 
     if (vm.count("magnet_offset")) {
-        std::cout << "Magnet Offset: " << magnet_offset << std::endl;
+        BOOST_LOG_TRIVIAL(trace)  << "Magnet Offset: " << magnet_offset << std::endl;
     }
 
     if (vm.count("time_offset")) {
-        std::cout << "Time Offset: " << time_offset << std::endl;
+        BOOST_LOG_TRIVIAL(trace) << "Time Offset: " << time_offset << std::endl;
     }
 
     magnetOffset = magnet_offset;
